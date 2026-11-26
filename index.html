@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Shader Dungeon</title>
+<link rel="icon" href="data:,">
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;color:#e8d9b8}
+canvas{position:fixed;inset:0;width:100vw;height:100vh;image-rendering:pixelated;display:block}
+#hud{position:fixed;left:8px;top:8px;padding:4px 8px;background:rgba(0,0,0,.55);border-radius:4px;white-space:pre;pointer-events:none}
+#gate,#win{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,.7);text-align:center;cursor:pointer}
+#gate h1,#win h1{font-size:28px;letter-spacing:4px;color:#ffb35c;margin:0 0 12px}
+.hidden{display:none!important}
+kbd{border:1px solid #806a4a;border-radius:3px;padding:0 4px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">loading…</div>
+<div id="gate"><h1>SHADER DUNGEON</h1>
+<div>Find the glowing rune.<br><br><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · mouse look · <kbd>←</kbd><kbd>→</kbd> turn · <kbd>Shift</kbd> run<br><br>Click to play</div></div>
+<div id="win" class="hidden"><h1>YOU ESCAPED</h1><div>Click to walk again</div></div>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// Map: one char per cell. Row index = world z, column index = world x.
+// '#' brick wall, 'M' mossy wall, 'o' pillar, '.' floor, 'S' start, 'E' exit.
+// The same array feeds the shader (as an R8UI texture) and JS collisions.
+// ---------------------------------------------------------------------------
+const MAP = [
+'########################',
+'#S...#.......M.........#',
+'#.##.#.#####.M.#######.#',
+'#.#..........M.#.....#.#',
+'#.#.####.###MM.#.o.o.#.#',
+'#...#..#...#...#.....#.#',
+'###.#..###.#.###.o.o.#.#',
+'#...#......#.........#.#',
+'#.#####.####.#########.#',
+'#.....#.#..............#',
+'#####.#.#.##########.###',
+'#.....#...#........#...#',
+'#.#####.###.o..o..o#.#.#',
+'#.......#..........#.#.#',
+'#.#####.#.o..o..o..#.#.#',
+'#.#...#.#..........#.#.#',
+'#.#.#.#.#####.######.#.#',
+'#...#.#.......#......#.#',
+'#.###.#######.#.######.#',
+'#.#.......M...#......#.#',
+'#.#.#####.M.#.######.#.#',
+'#...#.....M.#........#E#',
+'########################'];
+const CODES = { '.': 0, 'S': 0, '#': 1, 'M': 2, 'o': 3, 'E': 4 };
+const MW = MAP[0].length, MH = MAP.length;
+const cells = new Uint8Array(MW * MH);
+let start = [1.5, 1.5], exitPos = [1.5, 1.5];
+for (let z = 0; z < MH; z++) for (let x = 0; x < MW; x++) {
+  const ch = MAP[z][x];
+  cells[z * MW + x] = CODES[ch] ?? 1;
+  if (ch === 'S') start = [x + 0.5, z + 0.5];
+  if (ch === 'E') exitPos = [x + 0.5, z + 0.5];
+}
+const cellAt = (x, z) => (x < 0 || z < 0 || x >= MW || z >= MH) ? 1 : cells[z * MW + x];
+
+// ---------------------------------------------------------------------------
+// Shaders. The vertex shader only emits a fullscreen triangle; everything
+// else (geometry, materials, light, shadows, fog) lives in the fragment shader.
+// ---------------------------------------------------------------------------
+const VS = `#version 300 es
+void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.-1.,0,1);}`;
+
+const FS = `#version 300 es
+precision highp float;
+precision highp int;
+precision highp usampler2D;
+uniform vec2 uRes;      // render target size in pixels
+uniform float uTime;    // seconds
+uniform vec3 uCam;      // eye position (x, y, z)
+uniform vec2 uLook;     // yaw, pitch (radians)
+uniform vec3 uTorch;    // torch light position
+uniform float uFlick;   // torch intensity incl. flicker
+uniform vec3 uExit;     // exit rune position (floor level)
+uniform usampler2D uMap;// grid: 0 floor, 1 brick, 2 moss, 3 pillar, 4 exit
+uniform ivec2 uMapSize;
+out vec4 fragColor;
+
+const float CEIL = 1.0;   // ceiling height (cells are 1x1)
+const float PR = 0.17;    // pillar radius
+const vec3 TORCH = vec3(1.0, 0.55, 0.22);
+const vec3 RUNE = vec3(0.25, 0.9, 0.8);
+const vec3 FOG = vec3(0.012, 0.010, 0.012);
+
+// ---- helpers ---------------------------------------------------------------
+float hash12(vec2 p){vec3 q=fract(vec3(p.xyx)*.1031);q+=dot(q,q.yzx+33.33);return fract((q.x+q.y)*q.z);}
+float vnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
+  return mix(mix(hash12(i),hash12(i+vec2(1,0)),f.x),mix(hash12(i+vec2(0,1)),hash12(i+1.),f.x),f.y);}
+float fbm(vec2 p){return .5*vnoise(p)+.3*vnoise(p*2.3+7.1)+.2*vnoise(p*5.1+3.7);}
+
+uint cellAt(ivec2 c){
+  if(any(lessThan(c,ivec2(0)))||any(greaterThanEqual(c,uMapSize))) return 1u;
+  return texelFetch(uMap,c,0).r;
+}
+
+// ---- primary visibility: DDA grid traversal (exact, O(cells crossed)) ------
+// Walks the xz grid along the ray. Full-height boxes need no y test; pillars
+// get an analytic ray/circle test inside their cell. t is the 3D ray parameter.
+float traceGrid(vec3 ro, vec3 rd, float tMax, out vec3 n, out uint kind){
+  vec2 p = ro.xz;
+  vec2 d = vec2(abs(rd.x)<1e-5?1e-5:rd.x, abs(rd.z)<1e-5?1e-5:rd.z);
+  ivec2 c = ivec2(floor(p));
+  ivec2 st = ivec2(sign(d));
+  vec2 tDelta = abs(1./d);
+  vec2 tSide = (vec2(c) + max(vec2(st),0.) - p) / d;
+  float t = 0.; vec2 nn = vec2(0);
+  for(int i=0;i<64;i++){
+    uint k = cellAt(c);
+    if(k==1u||k==2u){ if(i>0){ n=vec3(nn.x,0,nn.y); kind=k; return t; } }
+    else if(k==3u){
+      vec2 oc = p-(vec2(c)+.5);
+      float a=dot(d,d), b=dot(oc,d), h=b*b-a*(dot(oc,oc)-PR*PR);
+      if(h>0.){ float tp=(-b-sqrt(h))/a;
+        if(tp>0. && tp<=min(tSide.x,tSide.y)){ vec2 q=normalize(oc+d*tp); n=vec3(q.x,0,q.y); kind=3u; return tp; } }
+    }
+    if(t>tMax) break;
+    if(tSide.x<tSide.y){ t=tSide.x; tSide.x+=tDelta.x; c.x+=st.x; nn=vec2(-float(st.x),0.); }
+    else               { t=tSide.y; tSide.y+=tDelta.y; c.y+=st.y; nn=vec2(0.,-float(st.y)); }
+  }
+  kind=0u; return 1e9;
+}
+
+// ---- SDF of the grid: boxes / pillars in the 3x3 neighbourhood --------------
+// Walls are full height, so a 2D distance in xz is exact for them.
+float sdWalls(vec3 p){
+  ivec2 c=ivec2(floor(p.xz)); float d=1e3;
+  for(int j=-1;j<=1;j++) for(int i=-1;i<=1;i++){
+    ivec2 q=c+ivec2(i,j); uint k=cellAt(q);
+    vec2 lp=p.xz-(vec2(q)+.5);
+    if(k==1u||k==2u){ vec2 b=abs(lp)-.5; d=min(d,length(max(b,0.))+min(max(b.x,b.y),0.)); }
+    else if(k==3u) d=min(d,length(lp)-PR);
+  }
+  return d;
+}
+
+// Cheap soft shadow: sphere-trace the SDF towards the light, keep the
+// smallest h/t ratio as penumbra estimate.
+float softShadow(vec3 ro, vec3 rd, float maxT){
+  float res=1., t=.03;
+  for(int i=0;i<20;i++){
+    float h=sdWalls(ro+rd*t);
+    res=min(res,10.*h/t);
+    t+=clamp(h,.03,.3);
+    if(res<.01||t>maxT) break;
+  }
+  return clamp(res,0.,1.);
+}
+
+// ---- materials ---------------------------------------------------------------
+// Brick pattern on a wall face; returns albedo, writes mortar mask to m.
+vec3 brick(vec2 uv, float moss, out float m){
+  vec2 s=vec2(4.,8.);                       // bricks per cell (u) and rows (v)
+  vec2 b=uv*s; float row=floor(b.y);
+  b.x+=mod(row,2.)*.5;
+  vec2 id=floor(b), f=fract(b);
+  vec2 e=min(f,1.-f)/s*vec2(1.,1.);         // distance to joint in cell units
+  m=smoothstep(.006,.016,min(e.x*.5,e.y));
+  float h=hash12(id+floor(uv*.999)*17.);
+  vec3 c=mix(vec3(.36,.30,.25),vec3(.52,.43,.33),h)*(.75+.5*fbm(uv*9.));
+  c=mix(vec3(.12,.11,.10),c,m);
+  float g=smoothstep(.45,.75,fbm(uv*3.+3.)*moss+(1.-uv.y)*.25*moss);
+  return mix(c,vec3(.13,.24,.08)*(.6+.6*fbm(uv*14.)),g*moss);
+}
+
+vec3 floorMat(vec2 p, out float m){
+  vec2 b=p*2.; vec2 id=floor(b), f=fract(b);
+  vec2 e=min(f,1.-f);
+  m=smoothstep(.02,.06,min(e.x,e.y));
+  float h=hash12(id);
+  vec3 c=mix(vec3(.28,.25,.22),vec3(.40,.36,.30),h)*(.7+.6*fbm(p*6.));
+  return mix(vec3(.08,.07,.06),c,m);
+}
+
+// ---- main ----------------------------------------------------------------------
+void main(){
+  vec2 uv=(gl_FragCoord.xy*2.-uRes)/uRes.y;
+  float cy=cos(uLook.x), sy=sin(uLook.x), cp=cos(uLook.y), sp=sin(uLook.y);
+  vec3 f=vec3(cp*sy,sp,cp*cy);
+  vec3 r=vec3(-cy,0.,sy);   // right-hand side matches the top-down MAP drawing
+  vec3 u=cross(r,f);
+  vec3 ro=uCam, rd=normalize(f+.85*(uv.x*r+uv.y*u));
+
+  // floor / ceiling planes, then walls (DDA stops at the plane distance)
+  float tPlane = rd.y<0. ? -ro.y/rd.y : (CEIL-ro.y)/max(rd.y,1e-5);
+  vec3 n; uint kind;
+  float t=traceGrid(ro,rd,tPlane,n,kind);
+  int mat; // 0 floor, 1 ceiling, 2 wall, 3 pillar
+  if(t<tPlane){ mat = kind==3u?3:2; }
+  else { t=tPlane; mat = rd.y<0.?0:1; n=vec3(0.,rd.y<0.?1.:-1.,0.); }
+  vec3 p=ro+rd*t;
+
+  // albedo, roughness proxy, ambient occlusion
+  vec3 alb; float mortar=1., spec=.15, ao=1.; vec3 emis=vec3(0);
+  ivec2 cell=ivec2(floor(p.xz-n.xz*.01));
+  if(mat==2){
+    vec2 fuv=vec2(abs(n.x)>.5?p.z:p.x,p.y);
+    alb=brick(fuv,kind==2u?1.:.15,mortar);
+    ao=smoothstep(0.,.25,p.y)*.6+.4; ao*=smoothstep(0.,.15,CEIL-p.y)*.4+.6;
+  } else if(mat==3){
+    float a=atan(n.z,n.x);
+    alb=brick(vec2(a*.35,p.y),.3,mortar)*.9;
+    ao=smoothstep(0.,.25,p.y)*.6+.4;
+  } else if(mat==0){
+    alb=floorMat(p.xz,mortar);
+    float dw=sdWalls(p);
+    ao=clamp(dw*4.+.3,0.,1.);
+    spec=.35*mortar; // slightly wet flagstones
+    if(cellAt(cell)==4u){ // exit rune
+      vec2 q=p.xz-uExit.xz; float rr=length(q), an=atan(q.y,q.x);
+      float ring=smoothstep(.02,0.,abs(rr-.32))+smoothstep(.015,0.,abs(rr-.22));
+      float spokes=smoothstep(.04,0.,abs(sin(an*3.+uTime*.5)))*step(rr,.22);
+      emis=RUNE*(ring+spokes*.7)*(1.6+.6*sin(uTime*3.));
+    }
+  } else {
+    // ceiling: rough stone with a wooden beam on every cell edge along x
+    alb=vec3(.16,.14,.13)*(.6+.8*fbm(p.xz*4.));
+    float beam=smoothstep(.08,.06,abs(fract(p.z)-.5)-.38);
+    alb=mix(alb,vec3(.22,.13,.07)*(.7+.5*vnoise(vec2(p.x*20.,p.z*2.))),beam);
+    ao=clamp(sdWalls(p)*3.+.4,0.,1.);
+  }
+
+  // torch light: inverse-square-ish falloff, Lambert + Blinn, soft shadow
+  vec3 L=uTorch-p; float dl=length(L); vec3 l=L/dl;
+  float att=uFlick/(1.+dl*dl*5.);
+  float diff=max(dot(n,l),0.);
+  float sh=0.;
+  if(diff>0.&&att>.004) sh=softShadow(p+n*.015,l,dl-.05);
+  vec3 h=normalize(l-rd);
+  float sp_=pow(max(dot(n,h),0.),24.)*spec*mortar;
+  vec3 col=(alb*diff+sp_)*TORCH*att*sh*2.4;
+
+  // exit rune light (no shadow) so the goal is visible from afar
+  vec3 Le=uExit+vec3(0,.05,0)-p; float de=length(Le);
+  col+=alb*RUNE*max(dot(n,Le/de),0.)*.25/(1.+de*de*3.);
+  col+=alb*vec3(.02,.022,.03)*ao;   // cold ambient
+  col*=mix(1.,ao,.7);
+  col+=emis;
+
+  // distance fog, faintly warmed by the torch near the player
+  float fogAmt=1.-exp(-t*.28);
+  col=mix(col,FOG+TORCH*uFlick*.025/(1.+t*t),fogAmt);
+
+  // tone map, vignette, gamma, dither
+  col=col*(2.51*col+.03)/(col*(2.43*col+.59)+.14);
+  col*=1.-.35*dot(uv*.6,uv*.6);
+  col=pow(clamp(col,0.,1.),vec3(1./2.2));
+  col+=(hash12(gl_FragCoord.xy+fract(uTime)*91.)-.5)/255.;
+  fragColor=vec4(col,1);
+}`;
+
+// ---------------------------------------------------------------------------
+// WebGL2 setup
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById('c');
+const hud = document.getElementById('hud');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, powerPreference: 'high-performance' });
+if (!gl) { hud.textContent = 'WebGL2 is not available in this browser.'; throw new Error('no webgl2'); }
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+gl.bindVertexArray(gl.createVertexArray());
+const U = {};
+for (const name of ['uRes', 'uTime', 'uCam', 'uLook', 'uTorch', 'uFlick', 'uExit', 'uMap', 'uMapSize'])
+  U[name] = gl.getUniformLocation(prog, name);
+
+// Map as an integer texture, fetched with texelFetch (no filtering).
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8UI, MW, MH, 0, gl.RED_INTEGER, gl.UNSIGNED_BYTE, cells);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.uniform1i(U.uMap, 0);
+gl.uniform2i(U.uMapSize, MW, MH);
+gl.uniform3f(U.uExit, exitPos[0], 0, exitPos[1]);
+
+// ---------------------------------------------------------------------------
+// URL options: ?scale=0.5 (fixed render scale) or ?scale=auto (default),
+// ?x=&z=&yaw=&pitch= start pose (handy for screenshots).
+// ---------------------------------------------------------------------------
+const qs = new URLSearchParams(location.search);
+const num = (k, d) => { const v = parseFloat(qs.get(k)); return Number.isFinite(v) ? v : d; };
+const scaleParam = qs.get('scale') || 'auto';
+const autoScale = scaleParam === 'auto';
+let scale = autoScale ? 0.75 : Math.min(2, Math.max(0.1, num('scale', 1)));
+
+const player = { x: num('x', start[0]), z: num('z', start[1]), yaw: num('yaw', Math.PI / 2), pitch: num('pitch', 0), bob: 0 };
+const EYE = 0.5, RADIUS = 0.22, PILLAR = 0.17;
+
+function resize() {
+  const w = Math.max(16, Math.round(innerWidth * scale));
+  const h = Math.max(16, Math.round(innerHeight * scale));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  gl.viewport(0, 0, w, h);
+}
+addEventListener('resize', resize);
+resize();
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+const keys = new Set();
+let playing = false, won = false;
+const gate = document.getElementById('gate'), win = document.getElementById('win');
+addEventListener('keydown', (e) => { keys.add(e.code); if (e.code.startsWith('Arrow')) e.preventDefault(); });
+addEventListener('keyup', (e) => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+function startPlay() {
+  gate.classList.add('hidden'); win.classList.add('hidden');
+  if (won) { won = false; player.x = start[0]; player.z = start[1]; player.yaw = Math.PI / 2; }
+  playing = true;
+  try { const r = canvas.requestPointerLock(); if (r && r.catch) r.catch(() => {}); } catch (_) { /* no pointer lock: arrows still work */ }
+}
+gate.addEventListener('click', startPlay);
+win.addEventListener('click', startPlay);
+canvas.addEventListener('click', () => { if (playing && document.pointerLockElement !== canvas) startPlay(); });
+addEventListener('mousemove', (e) => {
+  if (document.pointerLockElement !== canvas) return;
+  player.yaw -= e.movementX * 0.0025;
+  player.pitch = Math.max(-1.2, Math.min(1.2, player.pitch - e.movementY * 0.0025));
+});
+
+// Grid collision against the same map: circle vs wall AABB / pillar circle.
+function blocked(x, z) {
+  for (let cz = Math.floor(z - RADIUS); cz <= Math.floor(z + RADIUS); cz++)
+    for (let cx = Math.floor(x - RADIUS); cx <= Math.floor(x + RADIUS); cx++) {
+      const k = cellAt(cx, cz);
+      if (k === 1 || k === 2) {
+        const nx = Math.max(cx, Math.min(x, cx + 1)) - x, nz = Math.max(cz, Math.min(z, cz + 1)) - z;
+        if (nx * nx + nz * nz < RADIUS * RADIUS) return true;
+      } else if (k === 3) {
+        const dx = x - cx - 0.5, dz = z - cz - 0.5;
+        if (dx * dx + dz * dz < (RADIUS + PILLAR) ** 2) return true;
+      }
+    }
+  return false;
+}
+
+function update(dt) {
+  if (!playing || won) return;
+  const turn = (keys.has('ArrowRight') ? 1 : 0) - (keys.has('ArrowLeft') ? 1 : 0);
+  player.yaw -= turn * 2.2 * dt;
+  const fwd = (keys.has('KeyW') || keys.has('ArrowUp') ? 1 : 0) - (keys.has('KeyS') || keys.has('ArrowDown') ? 1 : 0);
+  const side = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+  let len = Math.hypot(fwd, side);
+  if (!len) return;
+  const speed = (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 2.6 : 1.5) * dt / len;
+  const s = Math.sin(player.yaw), c = Math.cos(player.yaw);
+  const dx = (s * fwd - c * side) * speed, dz = (c * fwd + s * side) * speed;
+  if (!blocked(player.x + dx, player.z)) player.x += dx;
+  if (!blocked(player.x, player.z + dz)) player.z += dz;
+  player.bob += dt * 9;
+  if (Math.floor(player.x) === Math.floor(exitPos[0]) && Math.floor(player.z) === Math.floor(exitPos[1])) {
+    won = true; playing = false; keys.clear();
+    if (document.exitPointerLock) document.exitPointerLock();
+    win.classList.remove('hidden');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Render loop + HUD
+// ---------------------------------------------------------------------------
+let fileSize = '…';
+fetch(location.href, { cache: 'no-store' }).then((r) => r.arrayBuffer())
+  .then((b) => { fileSize = b.byteLength + ' B'; })
+  .catch(() => { fileSize = '~' + new Blob([document.documentElement.outerHTML]).size + ' B'; });
+
+function render(t) {
+  const s = Math.sin(player.yaw), c = Math.cos(player.yaw);
+  const bob = Math.sin(player.bob) * 0.012;
+  // Torch held in the right hand, slightly ahead; stays inside the player radius.
+  const flick = 0.82 + 0.1 * Math.sin(t * 11.3) + 0.06 * Math.sin(t * 23.7 + 1.7) + 0.04 * Math.sin(t * 47.1);
+  gl.uniform2f(U.uRes, canvas.width, canvas.height);
+  gl.uniform1f(U.uTime, t);
+  gl.uniform3f(U.uCam, player.x, EYE + bob, player.z);
+  gl.uniform2f(U.uLook, player.yaw, player.pitch);
+  gl.uniform3f(U.uTorch, player.x + s * 0.12 - c * 0.12, EYE - 0.1 + bob * 1.5 + 0.01 * Math.sin(t * 17), player.z + c * 0.12 + s * 0.12);
+  gl.uniform1f(U.uFlick, flick);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+let last = performance.now(), acc = 0, frames = 0, fps = 0, ms = 0;
+const t0 = last;
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  update(dt);
+  render((now - t0) / 1000);
+  frames++; acc += dt;
+  if (acc >= 0.5) {
+    fps = frames / acc; ms = 1000 * acc / frames; frames = 0; acc = 0;
+    if (autoScale) {
+      const prev = scale;
+      if (fps < 40) scale = Math.max(0.3, scale * 0.85);
+      else if (fps > 58) scale = Math.min(1, scale * 1.08);
+      if (prev !== scale) resize();
+    }
+    hud.textContent = `FPS ${fps.toFixed(1)}  ${ms.toFixed(1)} ms\n` +
+      `render ${canvas.width}x${canvas.height}  scale ${scale.toFixed(2)}${autoScale ? ' (auto)' : ''}\n` +
+      `index.html ${fileSize}\npos ${player.x.toFixed(2)}, ${player.z.toFixed(2)}`;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// Test hook (used by scripts/smoke.mjs): state + a synchronous frame sample.
+window.dungeon = {
+  player, get fps() { return fps; }, get scale() { return scale; }, get fileSize() { return fileSize; }, blocked,
+  sample() {
+    render((performance.now() - t0) / 1000);
+    const w = canvas.width, h = canvas.height, px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    let sum = 0, sum2 = 0, n = 0;
+    for (let i = 0; i < px.length; i += 16) { const l = (px[i] + px[i + 1] + px[i + 2]) / 3; sum += l; sum2 += l * l; n++; }
+    const mean = sum / n;
+    return { mean, std: Math.sqrt(Math.max(0, sum2 / n - mean * mean)), w, h };
+  },
+};
+</script>
+</body>
+</html>
